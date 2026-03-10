@@ -550,21 +550,50 @@ class TimePicker(tk.Frame):
                        buttonbackground=BG_CARD, highlightthickness=1,
                        highlightbackground=BORDER, highlightcolor=ACCENT)
 
+        # Validation: allow only digits, max 2 characters
+        vcmd_num2 = (self.register(lambda P: P.isdigit() and len(P) <= 2 or P == ""), "P")
+
         self._sh = tk.Spinbox(self, from_=1, to=12, textvariable=self._hour,
-                              format="%02.0f", wrap=True, **spin_kw)
+                              format="%02.0f", wrap=True,
+                              validate="key", validatecommand=vcmd_num2, **spin_kw)
         self._sh.pack(side="left")
+        self._sh.bind("<FocusOut>", self._clamp_hour)
+        self._sh.bind("<Return>",   self._clamp_hour)
+
         tk.Label(self, text=":", bg=BG_PANEL, fg=ACCENT,
                  font=("Consolas", 16, "bold")).pack(side="left", padx=1)
 
         self._sm = tk.Spinbox(self, from_=0, to=55, textvariable=self._min,
-                              format="%02.0f", increment=5, wrap=True, **spin_kw)
+                              format="%02.0f", increment=5, wrap=True,
+                              validate="key", validatecommand=vcmd_num2, **spin_kw)
         self._sm.pack(side="left")
+        self._sm.bind("<FocusOut>", self._clamp_min)
+        self._sm.bind("<Return>",   self._clamp_min)
+
         tk.Label(self, text=" ", bg=BG_PANEL).pack(side="left", padx=2)
 
         self._sa = ttk.Combobox(self, textvariable=self._ampm,
                                 values=["AM", "PM"], width=3, state="readonly",
                                 font=("Segoe UI", 10, "bold"))
         self._sa.pack(side="left")
+
+    def _clamp_hour(self, event=None):
+        try:
+            v = int(self._hour.get())
+        except ValueError:
+            v = 0
+        v = max(1, min(12, v)) if v > 0 else 12
+        self._hour.set(f"{v:02d}")
+
+    def _clamp_min(self, event=None):
+        try:
+            v = int(self._min.get())
+        except ValueError:
+            v = 0
+        v = min(55, v)
+        # snap to nearest lower multiple of 5
+        v = (v // 5) * 5
+        self._min.set(f"{v:02d}")
 
     def set_now(self):
         now = datetime.now()
