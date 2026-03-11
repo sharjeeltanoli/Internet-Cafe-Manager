@@ -683,8 +683,10 @@ class CafeApp(tk.Tk):
         self._selected_dur    = "1:00"
         self._expire_timers   = {}       # {pc_num: datetime when rem first hit 0}
         self._glow_tick       = 0.0      # phase counter for glow animation
-        self._booking_alerted = set()    # booking IDs already alerted this session
-        self._session_alerted = set()    # record IDs alerted for 5-min warning
+        self._booking_alerted  = set()   # booking IDs already alerted this session
+        self._session_alerted  = set()   # record IDs alerted for 5-min warning
+        self._notifications    = []      # [{text, color, key}] active notifications
+        self._notif_index      = 0       # current rotation index
         self._ai_panel_open   = False
         self._ai_typing       = False
         self._chat_history    = []       # [{role, content, timestamp}]
@@ -706,10 +708,11 @@ class CafeApp(tk.Tk):
         self._update_pc_grid()
         self._check_booking_alerts()
         self._check_session_alerts()
+        self._sync_notifications()
         self.after(1000, self._tick_clock)
 
     def _check_session_alerts(self):
-        """Popup once when a fixed session has 5 minutes or less remaining."""
+        """Add bar notification when a fixed session has 5 min or less remaining."""
         now = datetime.now()
         for rec in self._records:
             if rec.get("session_type") in ("closed", "open"):
@@ -724,13 +727,17 @@ class CafeApp(tk.Tk):
             rem = int((t_out - now).total_seconds())
             if 0 < rem <= 300:
                 self._session_alerted.add(rid)
-                m, s = rem // 60, rem % 60
-                messagebox.showinfo(
-                    "Session Expiring Soon!",
-                    f"⚠  5 minutes left!\n\n"
-                    f"PC {rec['pc']} — {rec['name']}\n"
-                    f"Session ends at {rec['time_out']}",
-                    parent=self,
+                self._push_notification(
+                    text=f"PC {rec['pc']} - {rec['name']} ka time khatam hone wala hai!",
+                    color="#fb923c",   # orange
+                    key=f"warn_{rid}",
+                )
+            elif rem <= 0 and rid in self._session_alerted:
+                # Upgrade existing warn notification to expired (red)
+                self._push_notification(
+                    text=f"PC {rec['pc']} - {rec['name']} ka time khatam!",
+                    color=ACCENT,      # red
+                    key=f"exp_{rid}",
                 )
 
     def _check_booking_alerts(self):
@@ -743,15 +750,12 @@ class CafeApp(tk.Tk):
             if bid in self._booking_alerted:
                 continue
             exp = b.get("exp_time_minutes", -1)
-            # Alert when current time is at or just past the booking time (≤5 min)
             if 0 <= (now_total - exp) < 5:
                 self._booking_alerted.add(bid)
-                messagebox.showinfo(
-                    "Booking Alert!",
-                    f"Booking Alert!\n\n"
-                    f"{b['name']} expected at PC {b['pc']} now!\n"
-                    f"Expected Time: {b['exp_time']}",
-                    parent=self,
+                self._push_notification(
+                    text=f"Booking: {b['name']} PC {b['pc']} pe aa gaya!",
+                    color="#e3b341",   # yellow
+                    key=f"bk_{bid}",
                 )
 
     # ── glow animation loop (40 ms — independent of 1 s clock) ──────────────
@@ -1724,7 +1728,7 @@ class CafeApp(tk.Tk):
     def _build_summary(self):
         bar = tk.Frame(self, bg=BG_CARD)
         bar.grid(row=3, column=0, sticky="ew")
-        bar.columnconfigure(2, weight=1)
+        bar.columnconfigure(4, weight=1)   # notification area expands
 
         # left accent strip
         tk.Frame(bar, bg=ACCENT, width=4).grid(row=0, column=0, sticky="ns")
@@ -1740,6 +1744,74 @@ class CafeApp(tk.Tk):
         self._sessions_lbl = tk.Label(bar, text="0 sessions", bg=BG_CARD,
                                       fg=TEXT_DIM, font=("Segoe UI", 9))
         self._sessions_lbl.grid(row=0, column=3, padx=20)
+
+        # Divider
+        tk.Frame(bar, bg=BORDER, width=1).grid(row=0, column=4, sticky="ns",
+                                               padx=(0, 12), pady=8)
+
+        # Notification label — right side of bar
+        self._notif_lbl = tk.Label(bar, text="", bg=BG_CARD, fg="#fb923c",
+                                   font=("Segoe UI", 9, "bold"),
+                                   anchor="w", justify="left")
+        self._notif_lbl.grid(row=0, column=5, sticky="ew", padx=(0, 16))
+
+        # Start rotation ticker
+        self.after(3000, self._rotate_notification)
+
+    # ── NOTIFICATION BAR ─────────────────────────────────────────────────────
+    def _push_notification(self, text, color, key):
+        """Add or refresh a notification. `key` prevents duplicates."""
+        # Remove existing entry with same key, then append fresh
+        self._notifications = [n for n in self._notifications if n["key"] != key]
+        self._notifications.append({"text": text, "color": color, "key": key})
+        self._notif_index = len(self._notifications) - 1
+        self._show_current_notification()
+
+    def _remove_notification(self, key):
+        self._notifications = [n for n in self._notifications if n["key"] != key]
+        if self._notifications:
+            self._notif_index = self._notif_index % len(self._notifications)
+        else:
+            self._notif_index = 0
+        self._show_current_notification()
+
+    def _show_current_notification(self):
+        if not self._notifications:
+            self._notif_lbl.config(text="", fg="#fb923c")
+            return
+        n     = self._notifications[self._notif_index % len(self._notifications)]
+        count = len(self._notifications)
+        prefix = f"🔔 ({count}) " if count > 1 else "🔔 "
+        self._notif_lbl.config(text=prefix + n["text"], fg=n["color"])
+
+    def _rotate_notification(self):
+        if len(self._notifications) > 1:
+            self._notif_index = (self._notif_index + 1) % len(self._notifications)
+            self._show_current_notification()
+        self.after(3000, self._rotate_notification)
+
+    def _sync_notifications(self):
+        """Remove stale notifications whose session/booking is gone."""
+        now    = datetime.now()
+        active_ids = set()
+        for rec in self._records:
+            rid = rec.get("id", "")
+            st  = rec.get("session_type", "fixed")
+            if st == "closed":
+                continue
+            t_out = parse_session_time(rec.get("time_out", ""))
+            if t_out and t_out > now:
+                active_ids.add(f"warn_{rid}")
+            active_ids.add(f"exp_{rid}")   # keep expired until actually closed
+
+        pending_bk_ids = {f"bk_{b['id']}" for b in self._bookings
+                          if b.get("status") == "pending"}
+        active_ids |= pending_bk_ids
+
+        stale = [n["key"] for n in self._notifications
+                 if n["key"] not in active_ids]
+        for key in stale:
+            self._remove_notification(key)
 
     # ── RECALCULATE ──────────────────────────────────────────────────────────
     def _recalc(self):
@@ -1877,6 +1949,7 @@ class CafeApp(tk.Tk):
         self._refresh_table()
         self._update_summary()
         self._update_pc_grid()
+        self._sync_notifications()
         self._clear_form()
 
     def _log_edit(self, old_rec, new_rec):
@@ -2543,8 +2616,9 @@ class CafeApp(tk.Tk):
             self._v_amount.set(str(int(net_amt)))
             self._amount_manual = True
 
-        # Mark as started
+        # Mark as started and clear its notification
         booking["status"] = "started"
+        self._remove_notification(f"bk_{booking.get('id', '')}")
         self._persist()
         self._refresh_bookings()
         self._update_pc_grid()
