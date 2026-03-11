@@ -121,19 +121,19 @@ def save_config(cfg):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_cafe_data():
-    """Return (sessions, expenses, shutdown_pcs) for today from cafe_data.json.
+    """Return (sessions, expenses, shutdown_pcs, bookings) for today from cafe_data.json.
 
     If the file is missing, unreadable, or from a previous day the function
     returns empty defaults and removes the stale file so it stays small.
     """
     today_str = date.today().isoformat()
     if not os.path.exists(CAFE_DATA_FILE):
-        return [], [], set()
+        return [], [], set(), []
     try:
         with open(CAFE_DATA_FILE) as f:
             data = json.load(f)
     except Exception:
-        return [], [], set()
+        return [], [], set(), []
 
     if data.get("date") != today_str:
         # Stale data from a previous day — discard it.
@@ -141,20 +141,25 @@ def load_cafe_data():
             os.remove(CAFE_DATA_FILE)
         except Exception:
             pass
-        return [], [], set()
+        return [], [], set(), []
 
+    # Only restore pending bookings (started/cancelled don't need to reappear)
+    bookings = [b for b in data.get("bookings", [])
+                if b.get("status") == "pending"]
     return (data.get("sessions", []),
             data.get("expenses", []),
-            set(data.get("shutdown_pcs", [])))
+            set(data.get("shutdown_pcs", [])),
+            bookings)
 
 
-def save_cafe_data(records, expenses, shutdown_pcs=None):
-    """Persist today's session records, expenses, and shutdown state."""
+def save_cafe_data(records, expenses, shutdown_pcs=None, bookings=None):
+    """Persist today's session records, expenses, shutdown state, and bookings."""
     data = {
         "date":         date.today().isoformat(),
         "sessions":     records,
         "expenses":     expenses,
         "shutdown_pcs": list(shutdown_pcs or []),
+        "bookings":     bookings or [],
     }
     try:
         with open(CAFE_DATA_FILE, "w") as f:
@@ -582,16 +587,20 @@ class TimePicker(tk.Frame):
             v = int(self._hour.get())
         except ValueError:
             v = 0
-        v = max(1, min(12, v)) if v > 0 else 12
+        if v < 1:
+            v = 12       # empty or 0 → default to 12
+        elif v > 12:
+            v = 12       # over-range → cap at 12
         self._hour.set(f"{v:02d}")
 
     def _clamp_min(self, event=None):
         try:
             v = int(self._min.get())
         except ValueError:
-            v = 0
-        v = min(55, v)
-        # snap to nearest lower multiple of 5
+            v = 0        # empty → 00
+        if v > 55:
+            v = 55       # over-range → cap at 55
+        # snap down to nearest multiple of 5
         v = (v // 5) * 5
         self._min.set(f"{v:02d}")
 
@@ -639,7 +648,7 @@ class CafeApp(tk.Tk):
         self.minsize(1060, 820)
 
         self._cfg            = load_config()
-        self._records, self._expenses, self._shutdown_pcs = load_cafe_data()
+        self._records, self._expenses, self._shutdown_pcs, self._bookings = load_cafe_data()
         migrate_excel_format()                    # one-time column-format upgrade
         self._edit_idx       = None
         self._editing_open   = False    # True when editing an existing OPEN record
@@ -651,6 +660,7 @@ class CafeApp(tk.Tk):
         self._selected_dur   = "1:00"
         self._expire_timers  = {}       # {pc_num: datetime when rem first hit 0}
         self._glow_tick      = 0.0     # phase counter for glow animation
+        self._booking_alerted = set()  # booking IDs already alerted this session
 
         self._build_ui()
         self._refresh_table()
@@ -666,7 +676,29 @@ class CafeApp(tk.Tk):
         self._date_lbl.config(text=now.strftime("%A, %B %d %Y"))
         self._flash_state = not self._flash_state
         self._update_pc_grid()
+        self._check_booking_alerts()
         self.after(1000, self._tick_clock)
+
+    def _check_booking_alerts(self):
+        now = datetime.now()
+        now_total = now.hour * 60 + now.minute
+        for b in self._bookings:
+            if b.get("status") != "pending":
+                continue
+            bid = b.get("id", "")
+            if bid in self._booking_alerted:
+                continue
+            exp = b.get("exp_time_minutes", -1)
+            # Alert when current time is at or just past the booking time (≤5 min)
+            if 0 <= (now_total - exp) < 5:
+                self._booking_alerted.add(bid)
+                messagebox.showinfo(
+                    "Booking Alert!",
+                    f"Booking Alert!\n\n"
+                    f"{b['name']} expected at PC {b['pc']} now!\n"
+                    f"Expected Time: {b['exp_time']}",
+                    parent=self,
+                )
 
     # ── glow animation loop (40 ms — independent of 1 s clock) ──────────────
     def _tick_glow(self):
@@ -857,19 +889,25 @@ class CafeApp(tk.Tk):
             t_timer = cv.create_text(CX, 51, text="Available",
                                      fill=PC_FREE_FG,
                                      font=("Consolas", 9, "bold"))
+            # Small "BOOKED" badge — top-right corner of screen, hidden by default
+            t_booked = cv.create_text(SX1 - 3, SY0 + 3, text="",
+                                      fill=ACCENT2_H,
+                                      font=("Segoe UI", 6, "bold"),
+                                      anchor="ne")
 
             cv.bind("<Button-1>", lambda e, n=i: self._on_pc_click(n))
             cv.bind("<Button-3>", lambda e, n=i: self._on_pc_right_click(e, n))
 
             self._pc_boxes[i] = {
-                "canvas":     cv,
-                "screen":     scr,
-                "glow_ids":   glow_ids,   # [outer, mid, inner]
-                "glow_state": "free",     # set by _update_pc_grid
-                "glow_color": PC_FREE_FG, # primary colour for glow
-                "text_num":   t_num,
-                "text_name":  t_name,
-                "text_timer": t_timer,
+                "canvas":      cv,
+                "screen":      scr,
+                "glow_ids":    glow_ids,   # [outer, mid, inner]
+                "glow_state":  "free",     # set by _update_pc_grid
+                "glow_color":  PC_FREE_FG, # primary colour for glow
+                "text_num":    t_num,
+                "text_name":   t_name,
+                "text_timer":  t_timer,
+                "text_booked": t_booked,
             }
 
     def _on_pc_click(self, pc_num):
@@ -905,12 +943,12 @@ class CafeApp(tk.Tk):
 
     def _shutdown_pc(self, pc_num):
         self._shutdown_pcs.add(pc_num)
-        save_cafe_data(self._records, self._expenses, self._shutdown_pcs)
+        save_cafe_data(self._records, self._expenses, self._shutdown_pcs, self._bookings)
         self._update_pc_grid()
 
     def _turn_on_pc(self, pc_num):
         self._shutdown_pcs.discard(pc_num)
-        save_cafe_data(self._records, self._expenses, self._shutdown_pcs)
+        save_cafe_data(self._records, self._expenses, self._shutdown_pcs, self._bookings)
         self._update_pc_grid()
 
     def _update_add_btn_state(self):
@@ -1023,11 +1061,17 @@ class CafeApp(tk.Tk):
                         timer_txt = "TIME'S UP!"
                         glow_state, glow_color = "expired", PC_EXP_A
 
+            # Show BOOKED badge only when PC is occupied and has a pending booking
+            has_booking = any(str(b.get("pc")) == str(i) and b.get("status") == "pending"
+                              for b in self._bookings)
+            booked_txt = "BOOKED" if (has_booking and rec is not None) else ""
+
             # Update canvas screen + text
             cv = info["canvas"]
-            cv.itemconfig(info["screen"],     fill=bg)
-            cv.itemconfig(info["text_name"],  fill=fg_sub, text=name_txt)
-            cv.itemconfig(info["text_timer"], fill=fg_sub, text=timer_txt)
+            cv.itemconfig(info["screen"],      fill=bg)
+            cv.itemconfig(info["text_name"],   fill=fg_sub, text=name_txt)
+            cv.itemconfig(info["text_timer"],  fill=fg_sub, text=timer_txt)
+            cv.itemconfig(info["text_booked"], text=booked_txt)
             info["glow_state"] = glow_state
             info["glow_color"] = glow_color
 
@@ -1206,9 +1250,9 @@ class CafeApp(tk.Tk):
         self._tp_out = TimePicker(self._tout_picker_frame)
         self._tp_out.pack(anchor="w", padx=12, pady=(0, 2))
         for sp in (self._tp_out._sh, self._tp_out._sm, self._tp_out._sa):
-            sp.bind("<FocusOut>",           lambda e: self._recalc_open_edit())
-            sp.bind("<<ComboboxSelected>>", lambda e: self._recalc_open_edit())
-            sp.bind("<ButtonRelease>",      lambda e: self.after(100, self._recalc_open_edit))
+            sp.bind("<FocusOut>",           lambda e: self._recalc_open_edit(), add='+')
+            sp.bind("<<ComboboxSelected>>", lambda e: self._recalc_open_edit(), add='+')
+            sp.bind("<ButtonRelease>",      lambda e: self.after(100, self._recalc_open_edit), add='+')
 
         # -- Payment section (Amount only) --
         self._payment_sec_frame = tk.Frame(p, bg=BG_PANEL)
@@ -1245,9 +1289,9 @@ class CafeApp(tk.Tk):
 
         # ── bind Time-In spinners ─────────────────────────────────────────
         for sp in (self._tp_in._sh, self._tp_in._sm, self._tp_in._sa):
-            sp.bind("<FocusOut>",           lambda e: self._recalc())
-            sp.bind("<<ComboboxSelected>>", lambda e: self._recalc())
-            sp.bind("<ButtonRelease>",      lambda e: self.after(100, self._recalc))
+            sp.bind("<FocusOut>",           lambda e: self._recalc(), add='+')
+            sp.bind("<<ComboboxSelected>>", lambda e: self._recalc(), add='+')
+            sp.bind("<ButtonRelease>",      lambda e: self.after(100, self._recalc), add='+')
 
         # Show initial state (normal fixed session)
         self._update_form_visibility()
@@ -1388,7 +1432,8 @@ class CafeApp(tk.Tk):
         self._tab_btns = {}
         for tab_id, tab_label in (("current",  "▶  Current Users"),
                                    ("all",      "☰  All Records"),
-                                   ("expenses", "💰  Expenses")):
+                                   ("expenses", "💰  Expenses"),
+                                   ("bookings", "🔖  Bookings")):
             btn = tk.Button(tab_bar, text=tab_label,
                             command=lambda t=tab_id: self._switch_tab(t),
                             bg=BG_CARD, fg=TEXT_DIM,
@@ -1458,6 +1503,11 @@ class CafeApp(tk.Tk):
         self._exp_frame = tk.Frame(frame, bg=BG_MAIN)
         self._exp_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
         self._build_expenses_tab(self._exp_frame)
+
+        # ── Bookings panel (same row=2, hidden initially) ──────────────────────
+        self._bk_frame = tk.Frame(frame, bg=BG_MAIN)
+        self._bk_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        self._build_bookings_tab(self._bk_frame)
 
         # activate Current Users tab by default
         self._active_tab  = "current"
@@ -1585,6 +1635,7 @@ class CafeApp(tk.Tk):
         self._tree_cur.grid_remove(); self._vsb_cur.grid_remove()
         self._tree_all.grid_remove(); self._vsb_all.grid_remove()
         self._exp_frame.grid_remove()
+        self._bk_frame.grid_remove()
 
         if tab_id == "current":
             self._active_tree = self._tree_cur
@@ -1592,10 +1643,15 @@ class CafeApp(tk.Tk):
         elif tab_id == "all":
             self._active_tree = self._tree_all
             self._tree_all.grid(); self._vsb_all.grid()
-        else:  # expenses
+        elif tab_id == "expenses":
             self._active_tree = None
             self._exp_frame.grid()
             self._refresh_expense_summary()
+        else:  # bookings
+            self._active_tree = None
+            self._bk_frame.grid()
+            self._refresh_bookings()
+            self._refresh_bk_pc_btns()
 
     # ── SUMMARY BAR ─────────────────────────────────────────────────────────
     def _build_summary(self):
@@ -1753,7 +1809,7 @@ class CafeApp(tk.Tk):
         self._clear_form()
 
     def _persist(self):
-        save_cafe_data(self._records, self._expenses, self._shutdown_pcs)
+        save_cafe_data(self._records, self._expenses, self._shutdown_pcs, self._bookings)
         try:
             save_to_excel(self._records, self._expenses)
         except Exception as ex:
@@ -2048,6 +2104,365 @@ class CafeApp(tk.Tk):
         self._v_comment.set("")
         self._select_duration("1:00")   # resets selected_dur, calls _update_form_visibility
         self.after(50, self._recalc)
+
+    # ── BOOKINGS TAB ─────────────────────────────────────────────────────────
+    def _build_bookings_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+
+        # ── Booking Form ──────────────────────────────────────────────────────
+        form = tk.Frame(parent, bg=BG_PANEL)
+        form.grid(row=0, column=0, sticky="ew", pady=(0, 1))
+        form.columnconfigure(1, weight=1)
+        form.columnconfigure(3, weight=1)
+
+        # Row 0: Name + Expected Time In
+        tk.Label(form, text="Customer Name", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, padx=(12, 4),
+                                             pady=(10, 4), sticky="w")
+        self._bk_v_name = tk.StringVar()
+        nf = tk.Frame(form, bg=BG_CARD, highlightthickness=1,
+                      highlightbackground=BORDER)
+        nf.grid(row=0, column=1, sticky="ew", padx=(0, 12), pady=(10, 4))
+        tk.Entry(nf, textvariable=self._bk_v_name, bg=BG_CARD, fg=TEXT_H,
+                 insertbackground=TEXT_H, relief="flat",
+                 font=("Segoe UI", 10), highlightthickness=0).pack(
+            fill="x", padx=8, pady=4)
+
+        tk.Label(form, text="Expected Time In", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI", 8)).grid(row=0, column=2, padx=(0, 4),
+                                             pady=(10, 4), sticky="w")
+        self._bk_tp = TimePicker(form)
+        self._bk_tp.set_now()
+        self._bk_tp.grid(row=0, column=3, sticky="w", padx=(0, 12),
+                         pady=(10, 4))
+
+        # Row 1: Duration label
+        tk.Label(form, text="DURATION", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI", 7, "bold")).grid(
+            row=1, column=0, columnspan=4, padx=12, pady=(4, 2), sticky="w")
+        tk.Frame(form, bg=BORDER, height=1).grid(
+            row=2, column=0, columnspan=4, sticky="ew", padx=12)
+
+        # Row 3: Duration buttons
+        dur_g = tk.Frame(form, bg=BG_PANEL)
+        dur_g.grid(row=3, column=0, columnspan=4, sticky="ew", padx=12,
+                   pady=(4, 4))
+        for c in range(4):
+            dur_g.columnconfigure(c, weight=1)
+
+        self._bk_dur_btns    = {}
+        self._bk_selected_dur = "1:00"
+        for idx, (label, val) in enumerate(DURATION_PRESETS):
+            btn = tk.Button(dur_g, text=label,
+                            command=lambda v=val: self._bk_select_dur(v),
+                            bg=ACCENT2 if val == "1:00" else BG_CARD,
+                            fg="white"  if val == "1:00" else TEXT_MAIN,
+                            relief="flat", font=("Segoe UI", 9, "bold"),
+                            pady=4, cursor="hand2",
+                            activebackground=ACCENT2, activeforeground="white")
+            btn.grid(row=idx // 4, column=idx % 4, padx=2, pady=2, sticky="ew")
+            self._bk_dur_btns[val] = btn
+        open_btn = tk.Button(dur_g, text="∞  Open",
+                             command=lambda: self._bk_select_dur("open"),
+                             bg=BTN_ORANGE, fg="white", relief="flat",
+                             font=("Segoe UI", 9, "bold"), pady=4, cursor="hand2",
+                             activebackground=BTN_ORANGE_H, activeforeground="white")
+        open_btn.grid(row=2, column=0, columnspan=4, padx=2, pady=2, sticky="ew")
+        self._bk_dur_btns["open"] = open_btn
+
+        # Row 4: PC selector label
+        tk.Label(form, text="SELECT PC", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI", 7, "bold")).grid(
+            row=4, column=0, columnspan=4, padx=12, pady=(4, 2), sticky="w")
+        tk.Frame(form, bg=BORDER, height=1).grid(
+            row=5, column=0, columnspan=4, sticky="ew", padx=12)
+
+        # Row 6: PC buttons
+        pc_g = tk.Frame(form, bg=BG_PANEL)
+        pc_g.grid(row=6, column=0, columnspan=4, sticky="ew", padx=12,
+                  pady=(4, 4))
+        for c in range(5):
+            pc_g.columnconfigure(c, weight=1)
+
+        self._bk_v_pc    = tk.StringVar(value="1")
+        self._bk_pc_btns = {}
+        for i in range(1, 16):
+            btn = tk.Button(pc_g, text=str(i),
+                            command=lambda n=i: self._bk_select_pc(n),
+                            bg=ACCENT if i == 1 else BG_CARD,
+                            fg="white"  if i == 1 else TEXT_MAIN,
+                            relief="flat", font=("Segoe UI", 9, "bold"),
+                            width=3, pady=3, cursor="hand2",
+                            activebackground=ACCENT, activeforeground="white")
+            btn.grid(row=(i-1)//5, column=(i-1)%5, padx=2, pady=2, sticky="ew")
+            self._bk_pc_btns[i] = btn
+
+        # Row 7: Deposit + Add Booking button
+        r7 = tk.Frame(form, bg=BG_PANEL)
+        r7.grid(row=7, column=0, columnspan=4, sticky="ew", padx=12,
+                pady=(4, 10))
+        r7.columnconfigure(1, weight=1)
+
+        tk.Label(r7, text="Deposit (optional)", bg=BG_PANEL, fg=TEXT_DIM,
+                 font=("Segoe UI", 8)).grid(row=0, column=0, padx=(0, 4),
+                                             sticky="w")
+        self._bk_v_deposit = tk.StringVar()
+        dep_f = tk.Frame(r7, bg=BG_CARD, highlightthickness=1,
+                         highlightbackground=BORDER)
+        dep_f.grid(row=0, column=1, sticky="ew", padx=(0, 12))
+        tk.Label(dep_f, text="₱", bg=BG_CARD, fg=ACCENT,
+                 font=("Consolas", 10, "bold")).pack(side="left", padx=(6, 0))
+        tk.Entry(dep_f, textvariable=self._bk_v_deposit, bg=BG_CARD, fg=TEXT_H,
+                 insertbackground=TEXT_H, relief="flat",
+                 font=("Consolas", 10), highlightthickness=0, width=10).pack(
+            side="left", padx=4, pady=4)
+
+        add_btn = tk.Button(r7, text="＋  Add Booking",
+                            command=self._add_booking,
+                            bg=ACCENT2, fg="white",
+                            activebackground=ACCENT2_H,
+                            relief="flat", font=("Segoe UI", 10, "bold"),
+                            padx=14, pady=6, cursor="hand2")
+        add_btn.grid(row=0, column=2)
+        hover_bind(add_btn, ACCENT2, ACCENT2_H)
+
+        # ── Bookings List ──────────────────────────────────────────────────────
+        list_f = tk.Frame(parent, bg=BG_MAIN)
+        list_f.grid(row=1, column=0, sticky="nsew")
+        list_f.columnconfigure(0, weight=1)
+        list_f.rowconfigure(1, weight=1)
+
+        # Column header
+        hdr = tk.Frame(list_f, bg=BG_CARD)
+        hdr.grid(row=0, column=0, sticky="ew")
+        _BK_COLS = [("PC", 35), ("Name", 130), ("Expected Time", 105),
+                    ("Duration", 75), ("Deposit", 65), ("Status", 75),
+                    ("Actions", 175)]
+        for col_txt, col_w in _BK_COLS:
+            tk.Label(hdr, text=col_txt, bg=BG_CARD, fg=TEXT_DIM,
+                     font=("Segoe UI", 8, "bold"), width=col_w // 7,
+                     anchor="center").pack(side="left", padx=4, pady=5)
+
+        # Scrollable rows canvas
+        scrl_f = tk.Frame(list_f, bg=BG_MAIN)
+        scrl_f.grid(row=1, column=0, sticky="nsew")
+        scrl_f.columnconfigure(0, weight=1)
+        scrl_f.rowconfigure(0, weight=1)
+
+        self._bk_canvas = tk.Canvas(scrl_f, bg=BG_MAIN, highlightthickness=0)
+        vsb_bk = ttk.Scrollbar(scrl_f, orient="vertical",
+                                command=self._bk_canvas.yview)
+        self._bk_canvas.configure(yscrollcommand=vsb_bk.set)
+        self._bk_canvas.grid(row=0, column=0, sticky="nsew")
+        vsb_bk.grid(row=0, column=1, sticky="ns")
+
+        self._bk_list_frame = tk.Frame(self._bk_canvas, bg=BG_MAIN)
+        self._bk_canvas_win = self._bk_canvas.create_window(
+            (0, 0), window=self._bk_list_frame, anchor="nw")
+        self._bk_list_frame.bind(
+            "<Configure>",
+            lambda e: self._bk_canvas.configure(
+                scrollregion=self._bk_canvas.bbox("all")))
+        self._bk_canvas.bind(
+            "<Configure>",
+            lambda e: self._bk_canvas.itemconfig(
+                self._bk_canvas_win, width=e.width))
+
+    # Column pixel widths (must match header above)
+    _BK_COL_W = [35, 130, 105, 75, 65, 75, 175]
+
+    def _refresh_bookings(self):
+        for w in self._bk_list_frame.winfo_children():
+            w.destroy()
+        pending  = [b for b in self._bookings if b.get("status") == "pending"]
+        started  = [b for b in self._bookings if b.get("status") == "started"]
+        shown    = pending + started  # cancelled are removed from list
+        if not shown:
+            tk.Label(self._bk_list_frame, text="No bookings yet.",
+                     bg=BG_MAIN, fg=TEXT_DIM,
+                     font=("Segoe UI", 9)).pack(pady=20)
+            return
+        for i, b in enumerate(shown):
+            bg = ROW_ODD if i % 2 == 0 else ROW_EVEN
+            row = tk.Frame(self._bk_list_frame, bg=bg)
+            row.pack(fill="x")
+
+            status = b.get("status", "pending")
+            status_fg = "#e3b341" if status == "pending" else BTN_GREEN_H
+
+            cells = [
+                (str(b.get("pc", "")),    self._BK_COL_W[0], "center"),
+                (b.get("name", ""),       self._BK_COL_W[1], "w"),
+                (b.get("exp_time", ""),   self._BK_COL_W[2], "center"),
+                (b.get("duration", ""),   self._BK_COL_W[3], "center"),
+                (f"₱{b.get('deposit', 0):.0f}" if b.get("deposit", 0) > 0 else "—",
+                 self._BK_COL_W[4], "center"),
+            ]
+            for txt, w, anchor in cells:
+                tk.Label(row, text=txt, bg=bg, fg=TEXT_MAIN,
+                         font=("Segoe UI", 9), width=w // 7,
+                         anchor=anchor).pack(side="left", padx=4, pady=6)
+
+            # Status label
+            tk.Label(row, text=status.capitalize(), bg=bg, fg=status_fg,
+                     font=("Segoe UI", 9, "bold"),
+                     width=self._BK_COL_W[5] // 7,
+                     anchor="center").pack(side="left", padx=4)
+
+            # Action buttons
+            act_f = tk.Frame(row, bg=bg)
+            act_f.pack(side="left", padx=4)
+            if status == "pending":
+                start_btn = tk.Button(
+                    act_f, text="▶ Start",
+                    command=lambda bk=b: self._start_booking_session(bk),
+                    bg=BTN_GREEN, fg="white",
+                    activebackground=BTN_GREEN_H,
+                    relief="flat", font=("Segoe UI", 8, "bold"),
+                    padx=6, pady=2, cursor="hand2")
+                start_btn.pack(side="left", padx=(0, 4))
+                hover_bind(start_btn, BTN_GREEN, BTN_GREEN_H)
+
+                cancel_btn = tk.Button(
+                    act_f, text="✕ Cancel",
+                    command=lambda bk=b: self._cancel_booking(bk),
+                    bg=BG_CARD, fg=ACCENT,
+                    activebackground=ACCENT,
+                    activeforeground="white",
+                    relief="flat", font=("Segoe UI", 8),
+                    padx=6, pady=2, cursor="hand2",
+                    highlightthickness=1, highlightbackground=BORDER)
+                cancel_btn.pack(side="left")
+                hover_bind(cancel_btn, BG_CARD, ACCENT)
+
+    def _bk_select_dur(self, val):
+        self._bk_selected_dur = val
+        for v, btn in self._bk_dur_btns.items():
+            if v == "open":
+                btn.config(bg=BTN_ORANGE_H if v == val else BTN_ORANGE,
+                           fg="white")
+            else:
+                btn.config(bg=ACCENT2 if v == val else BG_CARD,
+                           fg="white"  if v == val else TEXT_MAIN)
+
+    def _bk_select_pc(self, pc_num):
+        self._bk_v_pc.set(str(pc_num))
+        for n, btn in self._bk_pc_btns.items():
+            if n == pc_num:
+                btn.config(bg=ACCENT, fg="white")
+            elif n in self._shutdown_pcs:
+                btn.config(bg="#1a1a1a", fg="#404040")
+            else:
+                btn.config(bg=BG_CARD, fg=TEXT_MAIN)
+
+    def _refresh_bk_pc_btns(self):
+        """Update booking form PC button colours to reflect current shutdown state."""
+        try:
+            sel = int(self._bk_v_pc.get())
+        except ValueError:
+            sel = 1
+        self._bk_select_pc(sel)
+
+    def _add_booking(self):
+        name = self._bk_v_name.get().strip()
+        if not name:
+            messagebox.showwarning("Missing", "Enter a customer name.", parent=self)
+            return
+        pc = self._bk_v_pc.get()
+        if int(pc) in self._shutdown_pcs:
+            messagebox.showwarning("PC Shutdown",
+                                   f"PC {pc} is shutdown and cannot be booked.",
+                                   parent=self)
+            return
+        try:
+            deposit = float(self._bk_v_deposit.get() or 0)
+            if deposit < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid", "Enter a valid deposit amount (0 or more).",
+                                   parent=self)
+            return
+
+        exp_time_str, exp_time_min = self._bk_tp.get_time()
+        dur = self._bk_selected_dur
+        dur_label = "Open" if dur == "open" else next(
+            (lbl for lbl, v in DURATION_PRESETS if v == dur), dur)
+
+        # Generate booking ID
+        prefix = f"BK-{date.today().strftime('%Y%m%d')}-"
+        max_seq = 0
+        for bk in self._bookings:
+            bid = bk.get("id", "")
+            if bid.startswith(prefix):
+                try:
+                    max_seq = max(max_seq, int(bid[len(prefix):]))
+                except ValueError:
+                    pass
+        booking = {
+            "id":               f"{prefix}{max_seq + 1:03d}",
+            "pc":               pc,
+            "name":             name,
+            "exp_time":         exp_time_str,
+            "exp_time_minutes": exp_time_min,
+            "duration":         dur_label,
+            "duration_key":     dur,
+            "duration_minutes": parse_dur_input(dur) if dur != "open" else 0,
+            "deposit":          deposit,
+            "status":           "pending",
+        }
+        self._bookings.append(booking)
+        self._bk_v_name.set("")
+        self._bk_v_deposit.set("")
+        self._persist()
+        self._refresh_bookings()
+        self._update_pc_grid()
+
+    def _start_booking_session(self, booking):
+        """Pre-fill the main session form from a booking and switch to it."""
+        pc_num = int(booking["pc"]) if str(booking["pc"]).isdigit() else 1
+        self._select_form_pc(pc_num)
+        self._v_name.set(booking["name"])
+
+        # Set Expected Time In
+        try:
+            parts = booking["exp_time"].split()
+            hm    = parts[0].split(":")
+            self._tp_in._hour.set(hm[0])
+            self._tp_in._min.set(hm[1])
+            self._tp_in._ampm.set(parts[1] if len(parts) > 1 else "AM")
+        except Exception:
+            self._tp_in.set_now()
+
+        # Set duration
+        dur_key = booking.get("duration_key", "1:00")
+        self._select_duration(dur_key)
+
+        # Subtract deposit from auto-calculated amount
+        deposit = booking.get("deposit", 0)
+        if deposit > 0 and dur_key != "open":
+            dur_min  = booking.get("duration_minutes", 0)
+            rate_key = f"rate_{dur_key}"
+            full_amt = (self._cfg[rate_key] if rate_key in self._cfg
+                        else calc_amount(dur_min, self._cfg))
+            net_amt  = max(0, full_amt - deposit)
+            self._v_amount.set(str(int(net_amt)))
+            self._amount_manual = True
+
+        # Mark as started
+        booking["status"] = "started"
+        self._persist()
+        self._refresh_bookings()
+        self._update_pc_grid()
+
+        # Switch to main form
+        self._switch_tab("current")
+
+    def _cancel_booking(self, booking):
+        self._bookings.remove(booking)
+        self._persist()
+        self._refresh_bookings()
+        self._update_pc_grid()
 
     # ── SETTINGS / FOLDER ───────────────────────────────────────────────────
     def _open_settings(self):
