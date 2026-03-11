@@ -3,6 +3,10 @@ from tkinter import ttk, messagebox
 import json
 import math
 import os
+import re
+import threading
+import urllib.request
+import urllib.error
 from datetime import datetime, date
 import openpyxl
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -16,14 +20,15 @@ CAFE_DATA_FILE = os.path.join(DATA_DIR, "cafe_data.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DEFAULT_CONFIG = {
-    "rate_0:30":  50,
-    "rate_1:00":  90,
-    "rate_1:30":  140,
-    "rate_2:00":  180,
-    "rate_2:30":  230,
-    "rate_3:00":  270,
-    "rate_4:00":  360,
-    "rate_5:00":  450,
+    "rate_0:30":         50,
+    "rate_1:00":         90,
+    "rate_1:30":         140,
+    "rate_2:00":         180,
+    "rate_2:30":         230,
+    "rate_3:00":         270,
+    "rate_4:00":         360,
+    "rate_5:00":         450,
+    "openrouter_api_key": "",
 }
 
 # ── colour palette ─────────────────────────────────────────────────────────────
@@ -121,19 +126,15 @@ def save_config(cfg):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_cafe_data():
-    """Return (sessions, expenses, shutdown_pcs, bookings) for today from cafe_data.json.
-
-    If the file is missing, unreadable, or from a previous day the function
-    returns empty defaults and removes the stale file so it stays small.
-    """
+    """Return (sessions, expenses, shutdown_pcs, bookings, edit_log) for today."""
     today_str = date.today().isoformat()
     if not os.path.exists(CAFE_DATA_FILE):
-        return [], [], set(), []
+        return [], [], set(), [], []
     try:
         with open(CAFE_DATA_FILE) as f:
             data = json.load(f)
     except Exception:
-        return [], [], set(), []
+        return [], [], set(), [], []
 
     if data.get("date") != today_str:
         # Stale data from a previous day — discard it.
@@ -141,7 +142,7 @@ def load_cafe_data():
             os.remove(CAFE_DATA_FILE)
         except Exception:
             pass
-        return [], [], set(), []
+        return [], [], set(), [], []
 
     # Only restore pending bookings (started/cancelled don't need to reappear)
     bookings = [b for b in data.get("bookings", [])
@@ -149,17 +150,20 @@ def load_cafe_data():
     return (data.get("sessions", []),
             data.get("expenses", []),
             set(data.get("shutdown_pcs", [])),
-            bookings)
+            bookings,
+            data.get("edit_log", []))
 
 
-def save_cafe_data(records, expenses, shutdown_pcs=None, bookings=None):
-    """Persist today's session records, expenses, shutdown state, and bookings."""
+def save_cafe_data(records, expenses, shutdown_pcs=None, bookings=None,
+                   edit_log=None):
+    """Persist today's session records, expenses, shutdown state, bookings, edit log."""
     data = {
         "date":         date.today().isoformat(),
         "sessions":     records,
         "expenses":     expenses,
         "shutdown_pcs": list(shutdown_pcs or []),
         "bookings":     bookings or [],
+        "edit_log":     edit_log or [],
     }
     try:
         with open(CAFE_DATA_FILE, "w") as f:
@@ -513,7 +517,24 @@ class SettingsDialog(tk.Toplevel):
                      highlightbackground=BORDER, highlightcolor=ACCENT).grid(
                 row=row, column=1, padx=20, pady=5, sticky="w")
 
-        save_row = len(self._RATE_FIELDS) + 2
+        # OpenRouter API key field
+        api_row = len(self._RATE_FIELDS) + 2
+        tk.Frame(self, bg=BORDER, height=1).grid(
+            row=api_row, column=0, columnspan=2, sticky="ew", padx=20, pady=(4, 8))
+        tk.Label(self, text="🤖  OpenRouter API Key", bg=BG_MAIN, fg=TEXT_H,
+                 font=("Segoe UI", 10, "bold")).grid(
+            row=api_row + 1, column=0, columnspan=2, padx=20, pady=(0, 4), sticky="w")
+        tk.Label(self, text="openrouter.ai → free account → API keys",
+                 bg=BG_MAIN, fg=TEXT_DIM, font=("Segoe UI", 8)).grid(
+            row=api_row + 2, column=0, columnspan=2, padx=20, pady=(0, 6), sticky="w")
+        self._api_key_var = tk.StringVar(value=cfg.get("openrouter_api_key", ""))
+        tk.Entry(self, textvariable=self._api_key_var, bg=BG_CARD, fg=TEXT_H,
+                 insertbackground=TEXT_H, relief="flat", width=32,
+                 font=("Consolas", 9), highlightthickness=1,
+                 highlightbackground=BORDER, highlightcolor=ACCENT2).grid(
+            row=api_row + 3, column=0, columnspan=2, padx=20, pady=(0, 4), sticky="ew")
+
+        save_row = api_row + 4
         tk.Button(self, text="  Save Changes  ", command=self._save,
                   bg=BTN_GREEN, fg="white", activebackground=BTN_GREEN_H,
                   relief="flat", font=("Segoe UI", 10, "bold"),
@@ -533,6 +554,7 @@ class SettingsDialog(tk.Toplevel):
                 messagebox.showerror("Error", "Enter valid positive numbers for all rates.",
                                      parent=self)
                 return
+        new_vals["openrouter_api_key"] = self._api_key_var.get().strip()
         self._cfg.update(new_vals)
         save_config(self._cfg)
         self._on_save()
@@ -648,19 +670,25 @@ class CafeApp(tk.Tk):
         self.minsize(1060, 820)
 
         self._cfg            = load_config()
-        self._records, self._expenses, self._shutdown_pcs, self._bookings = load_cafe_data()
+        (self._records, self._expenses, self._shutdown_pcs,
+         self._bookings, self._edit_log) = load_cafe_data()
         migrate_excel_format()                    # one-time column-format upgrade
-        self._edit_idx       = None
-        self._editing_open   = False    # True when editing an existing OPEN record
-        self._amount_manual  = False
-        self._flash_state    = False
-        self._pc_boxes       = {}
-        self._form_pc_btns   = {}
-        self._dur_btns       = {}
-        self._selected_dur   = "1:00"
-        self._expire_timers  = {}       # {pc_num: datetime when rem first hit 0}
-        self._glow_tick      = 0.0     # phase counter for glow animation
-        self._booking_alerted = set()  # booking IDs already alerted this session
+        self._edit_idx        = None
+        self._editing_open    = False    # True when editing an existing OPEN record
+        self._amount_manual   = False
+        self._flash_state     = False
+        self._pc_boxes        = {}
+        self._form_pc_btns    = {}
+        self._dur_btns        = {}
+        self._selected_dur    = "1:00"
+        self._expire_timers   = {}       # {pc_num: datetime when rem first hit 0}
+        self._glow_tick       = 0.0      # phase counter for glow animation
+        self._booking_alerted = set()    # booking IDs already alerted this session
+        self._session_alerted = set()    # record IDs alerted for 5-min warning
+        self._ai_panel_open   = False
+        self._ai_typing       = False
+        self._chat_history    = []       # [{role, content, timestamp}]
+        self._pending_record  = None     # AI-suggested record awaiting confirmation
 
         self._build_ui()
         self._refresh_table()
@@ -677,7 +705,33 @@ class CafeApp(tk.Tk):
         self._flash_state = not self._flash_state
         self._update_pc_grid()
         self._check_booking_alerts()
+        self._check_session_alerts()
         self.after(1000, self._tick_clock)
+
+    def _check_session_alerts(self):
+        """Popup once when a fixed session has 5 minutes or less remaining."""
+        now = datetime.now()
+        for rec in self._records:
+            if rec.get("session_type") in ("closed", "open"):
+                continue
+            rid = rec.get("id", "")
+            if not rid or rid in self._session_alerted:
+                continue
+            t_in  = parse_session_time(rec.get("time_in",  ""))
+            t_out = parse_session_time(rec.get("time_out", ""))
+            if not t_in or not t_out or t_in > now:
+                continue
+            rem = int((t_out - now).total_seconds())
+            if 0 < rem <= 300:
+                self._session_alerted.add(rid)
+                m, s = rem // 60, rem % 60
+                messagebox.showinfo(
+                    "Session Expiring Soon!",
+                    f"⚠  5 minutes left!\n\n"
+                    f"PC {rec['pc']} — {rec['name']}\n"
+                    f"Session ends at {rec['time_out']}",
+                    parent=self,
+                )
 
     def _check_booking_alerts(self):
         now = datetime.now()
@@ -739,6 +793,7 @@ class CafeApp(tk.Tk):
     # ── master layout ────────────────────────────────────────────────────────
     def _build_ui(self):
         self.columnconfigure(0, weight=1)
+        self.columnconfigure(1, weight=0)   # AI panel — fixed width, hidden by default
         self.rowconfigure(2, weight=1)
 
         self._build_header()
@@ -752,6 +807,7 @@ class CafeApp(tk.Tk):
         self._build_form(main)
         self._build_table(main)
         self._build_summary()
+        self._build_ai_panel()          # spans all rows in column=1
 
     # ── HEADER ───────────────────────────────────────────────────────────────
     def _build_header(self):
@@ -788,6 +844,17 @@ class CafeApp(tk.Tk):
                                   font=("Segoe UI", 8))
         self._date_lbl.pack(anchor="e")
 
+        # AI Assistant toggle button
+        self._ai_toggle_btn = tk.Button(
+            hdr, text="🤖  AI Assistant",
+            command=self._toggle_ai_panel,
+            bg=ACCENT2, fg="white",
+            activebackground=ACCENT2_H, activeforeground="white",
+            relief="flat", font=("Segoe UI", 9, "bold"),
+            padx=12, pady=6, cursor="hand2")
+        self._ai_toggle_btn.grid(row=0, column=2, padx=(0, 8))
+        hover_bind(self._ai_toggle_btn, ACCENT2, ACCENT2_H)
+
         # settings button
         settings_btn = tk.Button(hdr, text="⚙  Settings",
                                  command=self._open_settings,
@@ -798,7 +865,7 @@ class CafeApp(tk.Tk):
                                  padx=12, pady=6, cursor="hand2",
                                  highlightthickness=1,
                                  highlightbackground=BORDER)
-        settings_btn.grid(row=0, column=2, padx=16)
+        settings_btn.grid(row=0, column=3, padx=(0, 16))
         hover_bind(settings_btn, BG_MAIN, ACCENT2)
 
     # ── PC STATUS GRID ───────────────────────────────────────────────────────
@@ -943,12 +1010,12 @@ class CafeApp(tk.Tk):
 
     def _shutdown_pc(self, pc_num):
         self._shutdown_pcs.add(pc_num)
-        save_cafe_data(self._records, self._expenses, self._shutdown_pcs, self._bookings)
+        self._persist()
         self._update_pc_grid()
 
     def _turn_on_pc(self, pc_num):
         self._shutdown_pcs.discard(pc_num)
-        save_cafe_data(self._records, self._expenses, self._shutdown_pcs, self._bookings)
+        self._persist()
         self._update_pc_grid()
 
     def _update_add_btn_state(self):
@@ -1724,6 +1791,7 @@ class CafeApp(tk.Tk):
             diff  = m_out - m_in
             if diff < 0:
                 diff += 24 * 60
+            old_rec = dict(self._records[self._edit_idx])
             rec = dict(self._records[self._edit_idx])
             rec["name"]         = name
             rec["time_out"]     = self._tp_out.get_str()
@@ -1734,6 +1802,7 @@ class CafeApp(tk.Tk):
             rec["session_type"] = "fixed"
             rec["comment"]      = self._v_comment.get().strip()[:100]
             self._records[self._edit_idx] = rec
+            self._log_edit(old_rec, rec)
             self._edit_idx     = None
             self._editing_open = False
 
@@ -1795,8 +1864,10 @@ class CafeApp(tk.Tk):
                 "comment":      self._v_comment.get().strip()[:100],
             }
             if self._edit_idx is not None:
+                old_rec = dict(self._records[self._edit_idx])
                 rec["id"] = self._records[self._edit_idx].get("id", "")
                 self._records[self._edit_idx] = rec
+                self._log_edit(old_rec, rec)
                 self._edit_idx = None
             else:
                 rec["id"] = next_record_id(self._records)
@@ -1808,8 +1879,31 @@ class CafeApp(tk.Tk):
         self._update_pc_grid()
         self._clear_form()
 
+    def _log_edit(self, old_rec, new_rec):
+        """Compare old and new record dicts; append any changes to self._edit_log."""
+        _FIELDS = [("name", "Name"), ("time_in", "Time In"),
+                   ("time_out", "Time Out"), ("duration", "Duration"),
+                   ("amount", "Amount"), ("comment", "Comment")]
+        parts = []
+        for key, label in _FIELDS:
+            ov, nv = str(old_rec.get(key, "")), str(new_rec.get(key, ""))
+            if ov != nv:
+                parts.append(f"{label} changed from {ov} to {nv}")
+        if parts:
+            self._edit_log.append({
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "pc":        str(new_rec.get("pc", "")),
+                "name":      new_rec.get("name", ""),
+                "summary":   "; ".join(parts),
+                "changes":   [{"field": p.split(" changed")[0],
+                               "old":   p.split(" from ")[1].split(" to ")[0],
+                               "new":   p.split(" to ")[-1]}
+                              for p in parts],
+            })
+
     def _persist(self):
-        save_cafe_data(self._records, self._expenses, self._shutdown_pcs, self._bookings)
+        save_cafe_data(self._records, self._expenses, self._shutdown_pcs,
+                       self._bookings, self._edit_log)
         try:
             save_to_excel(self._records, self._expenses)
         except Exception as ex:
@@ -2464,9 +2558,397 @@ class CafeApp(tk.Tk):
         self._refresh_bookings()
         self._update_pc_grid()
 
+    # ── AI ASSISTANT PANEL ───────────────────────────────────────────────────
+    def _build_ai_panel(self):
+        panel = tk.Frame(self, bg=BG_PANEL, width=340)
+        panel.grid(row=0, column=1, rowspan=4, sticky="nsew")
+        panel.grid_propagate(False)
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(1, weight=1)
+        self._ai_panel_frame = panel
+        panel.grid_remove()          # hidden by default
+
+        # ── Panel header ──────────────────────────────────────────────────
+        hdr = tk.Frame(panel, bg=BG_CARD)
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.columnconfigure(0, weight=1)
+        tk.Label(hdr, text="🤖  AI Assistant", bg=BG_CARD, fg=TEXT_H,
+                 font=("Segoe UI", 11, "bold")).grid(
+            row=0, column=0, padx=12, pady=8, sticky="w")
+        tk.Button(hdr, text="✕", command=self._toggle_ai_panel,
+                  bg=BG_CARD, fg=TEXT_DIM, relief="flat",
+                  font=("Segoe UI", 10), cursor="hand2",
+                  activebackground=ACCENT, activeforeground="white").grid(
+            row=0, column=1, padx=8)
+        tk.Frame(hdr, bg=ACCENT2, height=2).grid(
+            row=1, column=0, columnspan=2, sticky="ew")
+
+        # API key notice (shown only if key is empty)
+        self._ai_notice_frame = tk.Frame(panel, bg="#1a1000")
+        self._ai_notice_frame.grid(row=2, column=0, sticky="ew")
+        self._ai_notice_lbl = tk.Label(
+            self._ai_notice_frame,
+            text="⚠  OpenRouter API key nahi hai.\nconfig.json mein 'openrouter_api_key' add karo.",
+            bg="#1a1000", fg="#e3b341",
+            font=("Segoe UI", 8), justify="left", wraplength=310)
+        self._ai_notice_lbl.pack(padx=10, pady=6, anchor="w")
+
+        # ── Messages area ─────────────────────────────────────────────────
+        msg_area = tk.Frame(panel, bg=BG_MAIN)
+        msg_area.grid(row=1, column=0, sticky="nsew")
+        msg_area.columnconfigure(0, weight=1)
+        msg_area.rowconfigure(0, weight=1)
+
+        self._chat_canvas = tk.Canvas(msg_area, bg=BG_MAIN, highlightthickness=0)
+        vsb = ttk.Scrollbar(msg_area, orient="vertical",
+                            command=self._chat_canvas.yview)
+        self._chat_canvas.configure(yscrollcommand=vsb.set)
+        self._chat_canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        self._chat_inner = tk.Frame(self._chat_canvas, bg=BG_MAIN)
+        self._chat_win = self._chat_canvas.create_window(
+            (0, 0), window=self._chat_inner, anchor="nw")
+        self._chat_inner.bind(
+            "<Configure>",
+            lambda e: self._chat_canvas.configure(
+                scrollregion=self._chat_canvas.bbox("all")))
+        self._chat_canvas.bind(
+            "<Configure>",
+            lambda e: self._chat_canvas.itemconfig(
+                self._chat_win, width=e.width))
+
+        # ── Input area ────────────────────────────────────────────────────
+        inp_outer = tk.Frame(panel, bg=BG_CARD)
+        inp_outer.grid(row=3, column=0, sticky="ew")
+        inp_outer.columnconfigure(0, weight=1)
+
+        inp_border = tk.Frame(inp_outer, bg=BG_CARD, highlightthickness=1,
+                              highlightbackground=BORDER)
+        inp_border.grid(row=0, column=0, columnspan=2, sticky="ew",
+                        padx=8, pady=8)
+        inp_border.columnconfigure(0, weight=1)
+
+        self._chat_input = tk.Text(
+            inp_border, bg=BG_CARD, fg=TEXT_H,
+            insertbackground=TEXT_H, relief="flat",
+            font=("Segoe UI", 10), height=3, wrap="word",
+            highlightthickness=0)
+        self._chat_input.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        self._chat_input.bind("<Return>",       self._on_chat_enter)
+        self._chat_input.bind("<Shift-Return>", lambda e: None)
+
+        send_btn = tk.Button(inp_outer, text="Send ▸",
+                             command=self._send_chat,
+                             bg=ACCENT2, fg="white",
+                             activebackground=ACCENT2_H,
+                             relief="flat", font=("Segoe UI", 9, "bold"),
+                             padx=12, pady=5, cursor="hand2")
+        send_btn.grid(row=1, column=0, sticky="e", padx=8, pady=(0, 8))
+        hover_bind(send_btn, ACCENT2, ACCENT2_H)
+
+        self._update_ai_notice()
+
+    def _update_ai_notice(self):
+        key = self._cfg.get("openrouter_api_key", "").strip()
+        if key:
+            self._ai_notice_frame.grid_remove()
+        else:
+            self._ai_notice_frame.grid()
+
+    def _toggle_ai_panel(self):
+        if self._ai_panel_open:
+            self._ai_panel_frame.grid_remove()
+            self._ai_panel_open = False
+            self._ai_toggle_btn.config(text="🤖  AI Assistant")
+        else:
+            self._update_ai_notice()
+            self._ai_panel_frame.grid()
+            self._ai_panel_open = True
+            self._ai_toggle_btn.config(text="✕  Close AI")
+            self._scroll_chat()
+
+    # ── Chat UI helpers ───────────────────────────────────────────────────
+    def _add_chat_message(self, role, text, timestamp=None):
+        if timestamp is None:
+            timestamp = datetime.now().strftime("%I:%M %p")
+        self._chat_history.append(
+            {"role": role, "content": text, "timestamp": timestamp})
+
+        is_user  = (role == "user")
+        bubble_bg = "#1d3557" if is_user else BG_CARD
+        pack_side = "right" if is_user else "left"
+
+        outer = tk.Frame(self._chat_inner, bg=BG_MAIN)
+        outer.pack(fill="x", padx=6, pady=3)
+
+        bubble = tk.Frame(outer, bg=bubble_bg, padx=10, pady=7)
+        bubble.pack(side=pack_side, anchor="e" if is_user else "w",
+                    padx=(60 if is_user else 0, 0 if is_user else 60))
+        tk.Label(bubble, text=text, bg=bubble_bg, fg=TEXT_H,
+                 font=("Segoe UI", 9), wraplength=220,
+                 justify="left", anchor="w").pack(anchor="w")
+        tk.Label(outer, text=timestamp, bg=BG_MAIN, fg=TEXT_DIM,
+                 font=("Segoe UI", 7)).pack(
+            side=pack_side, padx=4, pady=(0, 2), anchor="e" if is_user else "w")
+
+        self._scroll_chat()
+        if role == "assistant":
+            self._check_ai_action(text)
+
+    def _scroll_chat(self):
+        self._chat_canvas.update_idletasks()
+        self._chat_canvas.yview_moveto(1.0)
+
+    def _show_typing(self):
+        self._typing_frame = tk.Frame(self._chat_inner, bg=BG_MAIN)
+        self._typing_frame.pack(fill="x", padx=6, pady=3, anchor="w")
+        self._typing_lbl = tk.Label(
+            self._typing_frame, text="●", bg=BG_CARD, fg=TEXT_DIM,
+            font=("Segoe UI", 10), padx=10, pady=6)
+        self._typing_lbl.pack(side="left")
+        self._typing_dots = 0
+        self._animate_typing()
+        self._scroll_chat()
+
+    def _animate_typing(self):
+        if not self._ai_typing:
+            return
+        dots = ("●", "● ●", "● ● ●")[self._typing_dots % 3]
+        if hasattr(self, "_typing_lbl") and self._typing_lbl.winfo_exists():
+            self._typing_lbl.config(text=dots)
+        self._typing_dots += 1
+        self.after(380, self._animate_typing)
+
+    def _hide_typing(self):
+        self._ai_typing = False
+        if hasattr(self, "_typing_frame") and self._typing_frame.winfo_exists():
+            self._typing_frame.destroy()
+
+    # ── Chat send / receive ───────────────────────────────────────────────
+    def _on_chat_enter(self, event):
+        if not (event.state & 0x1):   # Shift not held → send
+            self._send_chat()
+            return "break"
+
+    def _send_chat(self):
+        text = self._chat_input.get("1.0", "end-1c").strip()
+        if not text:
+            return
+        self._chat_input.delete("1.0", "end")
+
+        # Route through confirmation handler if pending
+        if self._pending_record is not None:
+            self._add_chat_message("user", text)
+            self._handle_confirmation(text)
+            return
+
+        self._add_chat_message("user", text)
+        self._call_ai(text)
+
+    def _build_context(self):
+        now   = datetime.now()
+        lines = [f"Current time: {now.strftime('%I:%M %p, %A %B %d %Y')}"]
+
+        # Sessions
+        lines.append(f"\nSessions today ({len(self._records)}):")
+        for r in self._records:
+            st = r.get("session_type", "fixed")
+            lines.append(
+                f"  PC {r['pc']} | {r['name']} | In:{r['time_in']} | "
+                f"Out:{r.get('time_out','?')} | ₱{r.get('final',0):.0f} | {st}")
+
+        closed = [r for r in self._records if r.get("session_type") != "open"]
+        total  = sum(r.get("final", 0) for r in closed)
+        lines.append(f"Total earnings: ₱{total:.0f}")
+
+        # Expenses
+        if self._expenses:
+            lines.append(f"\nExpenses:")
+            for e in self._expenses:
+                lines.append(f"  {e['name']}: ₱{e['amount']:.0f}")
+            lines.append(f"  Total: ₱{sum(e['amount'] for e in self._expenses):.0f}")
+
+        # Edit log (last 15)
+        if self._edit_log:
+            lines.append(f"\nEdit log (last {min(15, len(self._edit_log))} changes):")
+            for lg in self._edit_log[-15:]:
+                lines.append(
+                    f"  [{lg['timestamp']}] PC {lg['pc']} {lg['name']}: {lg['summary']}")
+
+        # Pending bookings
+        pending_bk = [b for b in self._bookings if b.get("status") == "pending"]
+        if pending_bk:
+            lines.append(f"\nPending bookings:")
+            for b in pending_bk:
+                lines.append(
+                    f"  PC {b['pc']} | {b['name']} | {b['exp_time']} | {b['duration']}")
+
+        # Open sessions with elapsed time
+        open_s = [r for r in self._records
+                  if r.get("session_type") == "open" and r.get("time_out") == "OPEN"]
+        if open_s:
+            lines.append(f"\nOpen (running) sessions:")
+            for r in open_s:
+                t_in = parse_session_time(r["time_in"])
+                if t_in:
+                    el = int((now - t_in).total_seconds() // 60)
+                    elapsed = f"{el//60}h {el%60}m" if el >= 60 else f"{el}m"
+                else:
+                    elapsed = "?"
+                lines.append(f"  PC {r['pc']} | {r['name']} | running {elapsed}")
+
+        # PC status
+        on_pcs  = [i for i in range(1, 16) if i not in self._shutdown_pcs]
+        off_pcs = sorted(self._shutdown_pcs)
+        lines.append(f"\nPCs ON: {on_pcs}")
+        if off_pcs:
+            lines.append(f"PCs OFF: {off_pcs}")
+
+        return "\n".join(lines)
+
+    def _call_ai(self, user_text):
+        api_key = self._cfg.get("openrouter_api_key", "").strip()
+        if not api_key:
+            self._add_chat_message(
+                "assistant",
+                "OpenRouter API key config.json mein add karo.\n"
+                "'openrouter_api_key' field mein apni key paste karo.")
+            return
+
+        self._ai_typing = True
+        self._show_typing()
+
+        context = self._build_context()
+        system_prompt = (
+            "You are a helpful assistant for an internet cafe management app. "
+            "You understand both English and Roman Urdu (Urdu written in English). "
+            "Always reply in the SAME language the user uses. "
+            "If user writes Roman Urdu, reply in Roman Urdu. "
+            "If user writes English, reply in English.\n\n"
+            "IMPORTANT: When the user wants to ADD a session record "
+            "(e.g. 'PC 3 pe ali ka 1 ghanta laga do' or 'add Ahmed to PC 5 for 2 hours'), "
+            "extract PC number, name, and duration, calculate the amount from rates, "
+            "then include this EXACT marker in your response (on its own line):\n"
+            "[ADD_RECORD:{\"pc\":\"3\",\"name\":\"Ali\","
+            "\"duration_key\":\"1:00\",\"amount\":90}]\n"
+            "Then ask the user to confirm with yes/haan or no/nahi.\n\n"
+            "Available duration keys: 0:30, 1:00, 1:30, 2:00, 2:30, 3:00, 4:00, 5:00\n"
+            f"Current rates: {json.dumps({k:v for k,v in self._cfg.items() if k.startswith('rate_')})}\n\n"
+            "Current cafe data:\n" + context
+        )
+
+        # Build message list from history (last 20 messages)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in self._chat_history[-20:]:
+            if msg["role"] in ("user", "assistant"):
+                messages.append({"role": msg["role"], "content": msg["content"]})
+
+        def _do_request():
+            try:
+                payload = json.dumps({
+                    "model":    "mistralai/mistral-7b-instruct:free",
+                    "messages": messages,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    data=payload,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type":  "application/json",
+                        "HTTP-Referer":  "cafe-manager-app",
+                        "X-Title":       "Cafe Manager",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                reply = data["choices"][0]["message"]["content"].strip()
+                self.after(0, lambda: self._on_ai_response(reply))
+            except urllib.error.URLError:
+                self.after(0, lambda: self._on_ai_error(
+                    "Internet connection nahi hai ya API key check karo."))
+            except Exception as ex:
+                self.after(0, lambda: self._on_ai_error(
+                    f"Error: {ex}"))
+
+        threading.Thread(target=_do_request, daemon=True).start()
+
+    def _on_ai_response(self, reply):
+        self._hide_typing()
+        self._add_chat_message("assistant", reply)
+
+    def _on_ai_error(self, msg):
+        self._hide_typing()
+        self._add_chat_message("assistant", msg)
+
+    def _check_ai_action(self, text):
+        """Detect [ADD_RECORD:{...}] marker in AI response and store as pending."""
+        match = re.search(r'\[ADD_RECORD:(\{[^}]+\})\]', text)
+        if match:
+            try:
+                self._pending_record = json.loads(match.group(1))
+            except Exception:
+                self._pending_record = None
+
+    def _handle_confirmation(self, text):
+        """Process yes/no for a pending AI-suggested record."""
+        lower = text.lower().strip()
+        if lower in ("yes", "haan", "ha", "han", "y", "ok", "confirm"):
+            rec_data = self._pending_record
+            self._pending_record = None
+            try:
+                pc       = str(rec_data.get("pc", "1"))
+                name     = str(rec_data.get("name", "Guest"))
+                dur_key  = rec_data.get("duration_key", "1:00")
+                amt      = float(rec_data.get("amount", 0))
+                dur_min  = parse_dur_input(dur_key)
+                now      = datetime.now()
+                h12      = now.hour % 12 or 12
+                m_now    = math.ceil(now.minute / 5) * 5
+                if m_now >= 60:
+                    m_now = 0
+                    h12   = (now.hour + 1) % 12 or 12
+                ampm       = "AM" if now.hour < 12 else "PM"
+                time_in_s  = f"{h12:02d}:{m_now:02d} {ampm}"
+                time_in_m  = now.hour * 60 + now.minute
+                time_out_s = calc_timeout_str(time_in_m, dur_min)
+                new_rec = {
+                    "pc":           pc,
+                    "name":         name,
+                    "time_in":      time_in_s,
+                    "time_out":     time_out_s,
+                    "duration":     fmt_duration(dur_min),
+                    "amount":       amt,
+                    "discount":     0,
+                    "final":        amt,
+                    "session_type": "fixed",
+                    "advance":      0,
+                    "comment":      "Added via AI",
+                }
+                new_rec["id"] = next_record_id(self._records)
+                self._records.append(new_rec)
+                self._persist()
+                self._refresh_table()
+                self._update_summary()
+                self._update_pc_grid()
+                self._add_chat_message(
+                    "assistant",
+                    f"✅ Record add ho gaya!\n"
+                    f"PC {pc} — {name} — {fmt_duration(dur_min)} — ₱{amt:.0f}")
+            except Exception as ex:
+                self._add_chat_message("assistant", f"Record add karne mein error: {ex}")
+        else:
+            self._pending_record = None
+            self._add_chat_message("assistant",
+                                   "Theek hai, record add nahi kiya.")
+
     # ── SETTINGS / FOLDER ───────────────────────────────────────────────────
     def _open_settings(self):
-        SettingsDialog(self, self._cfg, lambda: setattr(self, "_cfg", load_config()))
+        def _after_save():
+            self._cfg = load_config()
+            self._update_ai_notice()
+        SettingsDialog(self, self._cfg, _after_save)
 
     def _open_folder(self):
         import subprocess, sys
