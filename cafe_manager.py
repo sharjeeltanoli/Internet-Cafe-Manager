@@ -2818,7 +2818,72 @@ class CafeApp(tk.Tk):
             return
 
         self._add_chat_message("user", text)
+
+        # Client-side PC control commands (no API call needed)
+        cmd = self._detect_pc_control_cmd(text)
+        if cmd == "shutdown_available":
+            self._exec_shutdown_available()
+            return
+        if cmd == "turnon_shutdown":
+            self._exec_turnon_all_shutdown()
+            return
+
         self._call_ai(text)
+
+    def _detect_pc_control_cmd(self, text):
+        """Return 'shutdown_available' or 'turnon_shutdown' if message matches, else None."""
+        t = text.lower()
+        has_pc   = "pc" in t
+        has_off  = any(w in t for w in ("off", "band", "shutdown", "bند"))
+        has_on   = any(w in t for w in ("on karo", "on kar", "chalu", "start", " on "))
+        is_extra = any(w in t for w in ("extra", "available", "khali", "free",
+                                         "use nahi", "jo use", "jo pc"))
+        is_shutd = any(w in t for w in ("off", "band", "shutdown"))
+
+        if has_pc and has_off and is_extra:
+            return "shutdown_available"
+        if has_pc and has_on and is_shutd:
+            return "turnon_shutdown"
+        # Also handle without "pc" keyword e.g. "extra band karo"
+        if not has_pc:
+            if is_extra and has_off:
+                return "shutdown_available"
+            if is_shutd and has_on:
+                return "turnon_shutdown"
+        return None
+
+    def _exec_shutdown_available(self):
+        """Shut down all currently available (free) PCs."""
+        available = [i for i in range(1, 16)
+                     if i not in self._shutdown_pcs
+                     and self._get_active_session(i) is None]
+        if not available:
+            self._add_chat_message(
+                "assistant",
+                "Koi bhi PC available nahi tha — sab occupied ya already off hain.")
+            return
+        for pc in available:
+            self._shutdown_pcs.add(pc)
+        self._persist()
+        self._update_pc_grid()
+        pc_list = ", ".join(f"PC {n}" for n in available)
+        self._add_chat_message(
+            "assistant",
+            f"{len(available)} PCs off kar diye: {pc_list}")
+
+    def _exec_turnon_all_shutdown(self):
+        """Turn on all shutdown PCs."""
+        if not self._shutdown_pcs:
+            self._add_chat_message("assistant", "Koi bhi PC off nahi tha.")
+            return
+        turned_on = sorted(self._shutdown_pcs)
+        self._shutdown_pcs.clear()
+        self._persist()
+        self._update_pc_grid()
+        pc_list = ", ".join(f"PC {n}" for n in turned_on)
+        self._add_chat_message(
+            "assistant",
+            f"{len(turned_on)} PCs on kar diye: {pc_list}")
 
     def _build_context(self):
         now   = datetime.now()
@@ -2911,6 +2976,10 @@ class CafeApp(tk.Tk):
             "[ADD_RECORD:{\"pc\":\"3\",\"name\":\"Ali\","
             "\"duration_key\":\"1:00\",\"amount\":90}]\n"
             "Then ask the user to confirm with yes/haan or no/nahi.\n\n"
+            "SPECIAL COMMANDS (handled instantly by the app, no marker needed):\n"
+            "- 'extra pc off karo' / 'available pc band karo' → turns off all free PCs\n"
+            "- 'extra pc on karo' / 'band pc on karo' → turns on all shutdown PCs\n"
+            "If user asks about these, tell them to just type the command.\n\n"
             "Available duration keys: 0:30, 1:00, 1:30, 2:00, 2:30, 3:00, 4:00, 5:00\n"
             f"Current rates: {json.dumps({k:v for k,v in self._cfg.items() if k.startswith('rate_')})}\n\n"
             "Current cafe data:\n" + context
