@@ -2844,39 +2844,55 @@ class CafeApp(tk.Tk):
             if msg["role"] in ("user", "assistant"):
                 messages.append({"role": msg["role"], "content": msg["content"]})
 
+        # Models tried in order; skips 429/provider errors and tries next
+        _FALLBACK_MODELS = [
+            "nvidia/nemotron-nano-9b-v2:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "mistralai/mistral-small-3.1-24b-instruct:free",
+            "nousresearch/hermes-3-llama-3.1-405b:free",
+            "openrouter/auto",
+        ]
+
         def _do_request():
-            try:
-                payload = json.dumps({
-                    "model":    "google/gemma-3n-e4b-it:free",
-                    "messages": messages,
-                }).encode("utf-8")
-                req = urllib.request.Request(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    data=payload,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type":  "application/json",
-                        "HTTP-Referer":  "cafe-manager-app",
-                        "X-Title":       "Cafe Manager",
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                reply = data["choices"][0]["message"]["content"].strip()
-                self.after(0, lambda: self._on_ai_response(reply))
-            except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", errors="ignore")
+            last_err = "Koi bhi model available nahi hai. Thodi der baad try karo."
+            for model in _FALLBACK_MODELS:
                 try:
-                    msg = json.loads(body)["error"]["message"]
-                except Exception:
-                    msg = body[:200]
-                self.after(0, lambda m=msg: self._on_ai_error(f"API Error: {m}"))
-            except urllib.error.URLError as e:
-                self.after(0, lambda: self._on_ai_error(
-                    "Internet connection nahi hai. Network check karo."))
-            except Exception as ex:
-                self.after(0, lambda m=str(ex): self._on_ai_error(f"Error: {m}"))
+                    payload = json.dumps({
+                        "model":    model,
+                        "messages": messages,
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        data=payload,
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type":  "application/json",
+                            "HTTP-Referer":  "cafe-manager-app",
+                            "X-Title":       "Cafe Manager",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    reply = data["choices"][0]["message"]["content"].strip()
+                    self.after(0, lambda r=reply: self._on_ai_response(r))
+                    return                          # success — stop trying
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode("utf-8", errors="ignore")
+                    try:
+                        last_err = json.loads(body)["error"]["message"]
+                    except Exception:
+                        last_err = body[:200]
+                    # 429 / provider error → try next model; anything else → stop
+                    if e.code not in (429, 400):
+                        break
+                except urllib.error.URLError:
+                    last_err = "Internet connection nahi hai. Network check karo."
+                    break
+                except Exception as ex:
+                    last_err = str(ex)
+                    break
+            self.after(0, lambda m=last_err: self._on_ai_error(m))
 
         threading.Thread(target=_do_request, daemon=True).start()
 
