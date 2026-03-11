@@ -2821,11 +2821,15 @@ class CafeApp(tk.Tk):
 
         context = self._build_context()
         system_prompt = (
-            "You are a helpful assistant for an internet cafe management app. "
-            "You understand both English and Roman Urdu (Urdu written in English). "
-            "Always reply in the SAME language the user uses. "
-            "If user writes Roman Urdu, reply in Roman Urdu. "
-            "If user writes English, reply in English.\n\n"
+            "You are a helpful cafe manager assistant.\n"
+            "IMPORTANT LANGUAGE RULE:\n"
+            "- NEVER write in Urdu script (never use arabic/urdu characters).\n"
+            "- ALWAYS respond in Roman Urdu (Urdu words written in English alphabets).\n"
+            "- Example of Roman Urdu: 'Aaj ka total 1500 rupay hai', "
+            "'PC 3 pe ali 1 ghante se baitha hai'.\n"
+            "- If user writes in English, reply in English.\n"
+            "- If user writes in Roman Urdu, reply in Roman Urdu.\n"
+            "- Never mix Urdu script characters in any response.\n\n"
             "IMPORTANT: When the user wants to ADD a session record "
             "(e.g. 'PC 3 pe ali ka 1 ghanta laga do' or 'add Ahmed to PC 5 for 2 hours'), "
             "extract PC number, name, and duration, calculate the amount from rates, "
