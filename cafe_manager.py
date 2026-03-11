@@ -3072,15 +3072,20 @@ class CafeApp(tk.Tk):
                 dur_key  = rec_data.get("duration_key", "1:00")
                 amt      = float(rec_data.get("amount", 0))
                 dur_min  = parse_dur_input(dur_key)
-                now      = datetime.now()
-                h12      = now.hour % 12 or 12
-                m_now    = math.ceil(now.minute / 5) * 5
-                if m_now >= 60:
-                    m_now = 0
-                    h12   = (now.hour + 1) % 12 or 12
-                ampm       = "AM" if now.hour < 12 else "PM"
-                time_in_s  = f"{h12:02d}:{m_now:02d} {ampm}"
-                time_in_m  = now.hour * 60 + now.minute
+                now        = datetime.now()
+                # Round current minute UP to next 5-minute mark
+                raw_h24    = now.hour
+                m_rounded  = math.ceil(now.minute / 5) * 5
+                if m_rounded >= 60:
+                    m_rounded = 0
+                    raw_h24  += 1
+                    if raw_h24 >= 24:
+                        raw_h24 = 0
+                h12        = raw_h24 % 12 or 12
+                ampm       = "AM" if raw_h24 < 12 else "PM"
+                time_in_s  = f"{h12:02d}:{m_rounded:02d} {ampm}"
+                # Time Out = rounded Time In + duration (minutes end in 0 or 5)
+                time_in_m  = raw_h24 * 60 + m_rounded
                 time_out_s = calc_timeout_str(time_in_m, dur_min)
                 new_rec = {
                     "pc":           pc,
