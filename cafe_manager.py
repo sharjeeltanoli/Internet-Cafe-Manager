@@ -2847,7 +2847,7 @@ class CafeApp(tk.Tk):
         def _do_request():
             try:
                 payload = json.dumps({
-                    "model":    "mistralai/mistral-7b-instruct:free",
+                    "model":    "google/gemma-3n-e4b-it:free",
                     "messages": messages,
                 }).encode("utf-8")
                 req = urllib.request.Request(
@@ -2865,12 +2865,18 @@ class CafeApp(tk.Tk):
                     data = json.loads(resp.read().decode("utf-8"))
                 reply = data["choices"][0]["message"]["content"].strip()
                 self.after(0, lambda: self._on_ai_response(reply))
-            except urllib.error.URLError:
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="ignore")
+                try:
+                    msg = json.loads(body)["error"]["message"]
+                except Exception:
+                    msg = body[:200]
+                self.after(0, lambda m=msg: self._on_ai_error(f"API Error: {m}"))
+            except urllib.error.URLError as e:
                 self.after(0, lambda: self._on_ai_error(
-                    "Internet connection nahi hai ya API key check karo."))
+                    "Internet connection nahi hai. Network check karo."))
             except Exception as ex:
-                self.after(0, lambda: self._on_ai_error(
-                    f"Error: {ex}"))
+                self.after(0, lambda m=str(ex): self._on_ai_error(f"Error: {m}"))
 
         threading.Thread(target=_do_request, daemon=True).start()
 
