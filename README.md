@@ -1,4 +1,4 @@
-# ☕ Internet Cafe Manager
+# Internet Cafe Manager
 
 A lightweight, single-file desktop application for managing an internet café — built with **Python + Tkinter**.  
 Track PC sessions, log expenses, handle bookings, and export daily reports to Excel, all from a dark-themed GUI that runs instantly on any Windows PC.
